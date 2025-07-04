@@ -6,6 +6,13 @@ import time
 import traceback
 import json
 import os
+from langchain.agents import initialize_agent, AgentType
+from langchain.memory import ConversationBufferMemory
+from langchain_openai import ChatOpenAI
+from langchain_community.utilities import SerpAPIWrapper
+from langchain.tools import Tool
+from langgraph.prebuilt import create_react_agent
+from langgraph.graph import StateGraph
 
 from app.core.config import settings
 from app.services.r2_service import r2_service # Import the R2 service instance
@@ -60,6 +67,29 @@ def save_dev_ids(assistant_id: str, thread_id: str):
 # 开发阶段：从本地文件加载或创建新的 assistant 和 thread
 assistant_id, thread_id = load_dev_ids()
 
+# === LangGraph ReAct Agent (with web search) ===
+llm = ChatOpenAI(
+    openai_api_key=settings.OPENAI_API_KEY,
+    openai_api_base=settings.OPENAI_BASE_PATH,
+    model_name="gpt-4o-mini",  # 使用 4.1 mini 模型
+    temperature=0.7,
+)
+search_api = SerpAPIWrapper(serpapi_api_key=settings.SERPAPI_API_KEY)
+search_tool = Tool(
+    name="search",
+    func=search_api.run,
+    description="Searches the web using SerpAPI"
+)
+tools = [search_tool]
+
+react_agent = create_react_agent(llm, tools)
+
+# 正确的 StateGraph 初始化
+graph = StateGraph(dict)
+graph.add_node("agent", react_agent)
+graph.set_entry_point("agent")
+app_graph = graph.compile()
+
 class PromptRequest(BaseModel):
     prompt: str
     voice: Literal["alloy", "echo", "fable", "onyx", "nova", "shimmer"] = "onyx"
@@ -80,6 +110,14 @@ class ChatResponse(BaseModel):
 
 class TranscriptionResponse(BaseModel):
     content: str
+
+class AgentChatRequest(BaseModel):
+    prompt: str
+    model_name: str | None = None  # 新增，可选模型名
+
+class AgentChatResponse(BaseModel):
+    content: str
+    history: list
 
 @router.post("/generate/speech", response_model=SpeechResponse)
 async def generate_speech_from_prompt(request: PromptRequest):
@@ -225,6 +263,40 @@ async def generate_transcription(file: UploadFile = File(...)):
             error_detail += f"\nStatus code: {e.status_code}"
         print(f"An error occurred in transcription endpoint: {error_detail}\nTraceback:\n{tb}")
         raise HTTPException(status_code=500, detail=error_detail)
+
+@router.post("/generate/agent_chat", response_model=AgentChatResponse)
+async def generate_agent_chat_response(request: AgentChatRequest):
+    """
+    用 LangGraph ReAct Agent 实现的对话接口
+    """
+    try:
+        # 动态选择模型名
+        model_name = request.model_name or getattr(settings, "OPENAI_MODEL_NAME", None) or "gpt-4o-mini"
+        llm = ChatOpenAI(
+            openai_api_key=settings.OPENAI_API_KEY,
+            openai_api_base=settings.OPENAI_BASE_PATH,
+            model_name=model_name,
+            temperature=0.7,
+        )
+        react_agent = create_react_agent(llm, tools)
+        graph = StateGraph(dict)
+        graph.add_node("agent", react_agent)
+        graph.set_entry_point("agent")
+        app_graph = graph.compile()
+        # 传递历史对话（如需多轮对话，可自行管理 history）
+        state = {"messages": [{"role": "user", "content": request.prompt}]}
+        result = app_graph.invoke(state)
+        history = result["messages"]
+        ai_reply = next((m.content for m in reversed(history) if getattr(m, "type", None) == "ai"), "")
+        history_dict = [
+            {"role": getattr(m, "type", None), "content": m.content}
+            for m in history
+        ]
+        return {"content": ai_reply, "history": history_dict}
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"LangGraph agent error: {e}\n{tb}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Assistant API 管理端点
 

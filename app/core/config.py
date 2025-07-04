@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     # 对于 Microsoft Azure OpenAI，格式为：
     # https://your-resource-name.openai.azure.com/openai/deployments/your-deployment-name
     OPENAI_BASE_PATH: Optional[str] = None
+    OPENAI_MODEL_NAME: Optional[str] = None
 
     # Cloudflare R2 Credentials
     CLOUDFLARE_R2_ACCOUNT_ID: Optional[str] = None
@@ -18,6 +19,9 @@ class Settings(BaseSettings):
     CLOUDFLARE_R2_SECRET_ACCESS_KEY: Optional[str] = None
     CLOUDFLARE_R2_BUCKET_NAME: Optional[str] = None
     R2_PUBLIC_DOMAIN: Optional[str] = None # e.g., "pub-your-hash.r2.dev"
+
+    # SERPAPI Credentials
+    SERPAPI_API_KEY: str = ""  # 新增，用于 SerpAPI 搜索
 
     class Config:
         case_sensitive = True
