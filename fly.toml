@@ -1,0 +1,41 @@
+# fly.toml app configuration file generated for buoy-english-learning on 2024-12-19T10:00:00Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+
+app = "buoy-english-learning"
+primary_region = "hkg"
+
+[build]
+
+[env]
+  PORT = "8080"
+  OPENAI_API_KEY = "sk-Hc7f8e451542d83c6bffa18a3e59edf827dc76b3c5cZUd1q"
+  OPENAI_BASE_PATH = "https://api.gptsapi.net/v1"
+  CLOUDFLARE_R2_ACCOUNT_ID = "72edf5e8275840b1888ee7efd7e34653"
+  CLOUDFLARE_R2_ACCESS_KEY_ID = "e1fb551e533d8c824575544ab279376b"
+  CLOUDFLARE_R2_SECRET_ACCESS_KEY = "4ac27a37b98252216ac9a0acaa11f26f05ba9fa0ad1c70aa2f411f6be8c4bf40"
+  CLOUDFLARE_R2_BUCKET_NAME = "english-learning-speech"
+  R2_PUBLIC_DOMAIN = "dummy.r2.dev"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  timeout = "5s"
+  path = "/"
+
+[processes]
+  app = "uvicorn app.main:app --host 0.0.0.0 --port 8080"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512 

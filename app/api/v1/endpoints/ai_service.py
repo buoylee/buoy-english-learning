@@ -12,6 +12,17 @@ from app.services.r2_service import r2_service # Import the R2 service instance
 
 router = APIRouter()
 
+# Debug: Print environment variables
+print(f"=== Environment Variables Debug ===")
+print(f"OPENAI_API_KEY: {settings.OPENAI_API_KEY[:10]}..." if settings.OPENAI_API_KEY else "OPENAI_API_KEY: None")
+print(f"OPENAI_BASE_PATH: {settings.OPENAI_BASE_PATH}")
+print(f"CLOUDFLARE_R2_ACCOUNT_ID: {settings.CLOUDFLARE_R2_ACCOUNT_ID}")
+print(f"CLOUDFLARE_R2_ACCESS_KEY_ID: {settings.CLOUDFLARE_R2_ACCESS_KEY_ID}")
+print(f"CLOUDFLARE_R2_SECRET_ACCESS_KEY: {settings.CLOUDFLARE_R2_SECRET_ACCESS_KEY[:10]}..." if settings.CLOUDFLARE_R2_SECRET_ACCESS_KEY else "CLOUDFLARE_R2_SECRET_ACCESS_KEY: None")
+print(f"CLOUDFLARE_R2_BUCKET_NAME: {settings.CLOUDFLARE_R2_BUCKET_NAME}")
+print(f"R2_PUBLIC_DOMAIN: {settings.R2_PUBLIC_DOMAIN}")
+print(f"===================================")
+
 # Initialize the OpenAI client
 client = OpenAI(
     api_key=settings.OPENAI_API_KEY,
@@ -61,7 +72,6 @@ class SpeechResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     prompt: str
-    assistant_id: Optional[str] = None  # 可选的 assistant ID，如果不提供则使用默认的
 
 class ChatResponse(BaseModel):
     content: str
@@ -143,10 +153,8 @@ async def generate_speech_from_prompt(request: PromptRequest):
 @router.post("/generate/chat", response_model=ChatResponse)
 async def generate_chat_response(request: ChatRequest):
     """
-    接收一个文本，使用 OpenAI 的 Assistant API 进行对话，将结果返回给前端。
+    接收一个文本，使用 OpenAI 的 Chat API 进行对话，将结果返回给前端。
     """
-    global assistant_id, thread_id
-    
     print(f"OpenAI Base Path: {settings.OPENAI_BASE_PATH}")
     print(f"OpenAI API Key: {settings.OPENAI_API_KEY[:10]}..." if settings.OPENAI_API_KEY else "OpenAI API Key: Not set")
     
@@ -154,73 +162,30 @@ async def generate_chat_response(request: ChatRequest):
         raise HTTPException(status_code=500, detail="OpenAI API key is not configured on the server.")
     
     try:
-        # 如果没有 assistant_id，创建一个新的 assistant
-        if assistant_id is None:
-            assistant = client.beta.assistants.create(
-                name="English Learning Assistant",
-                instructions="You are a helpful English learning assistant. Help users improve their English skills through conversation, grammar correction, and vocabulary building.",
-                model="gpt-4o-mini"
-            )
-            assistant_id = assistant.id
-            print(f"Created new assistant with ID: {assistant_id}")
-        else:
-            print(f"Using existing assistant: {assistant_id}")
-        
-        # 如果没有 thread_id，创建一个新的 thread
-        if thread_id is None:
-            thread = client.beta.threads.create()
-            thread_id = thread.id
-            print(f"Created new thread with ID: {thread_id}")
-        else:
-            print(f"Using existing thread: {thread_id}")
-        
-        # 保存 ID 到本地文件
-        save_dev_ids(assistant_id, thread_id)
-        
-        # 添加用户消息到 thread
-        message = client.beta.threads.messages.create(
-            thread_id = thread_id,
-            role="user",
-            content=request.prompt
+        # 使用 Chat API 进行对话
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful English learning assistant. Help users improve their English skills through conversation, grammar correction, and vocabulary building."
+                },
+                {
+                    "role": "user",
+                    "content": request.prompt
+                }
+            ],
+            max_tokens=1000,
+            temperature=0.7
         )
-        print(f"Added message to thread: {message.id}")
         
-        # 运行 assistant
-        run = client.beta.threads.runs.create(
-            thread_id=thread_id,
-            assistant_id=assistant_id
-        )
-        print(f"Started run: {run.id}")
-        
-        # 等待 run 完成
-        while True:
-            run_status = client.beta.threads.runs.retrieve(
-                thread_id=thread_id,
-                run_id=run.id
-            )
-            print(f"Run status: {run_status.status}")
-            
-            if run_status.status == "completed":
-                break
-            elif run_status.status == "failed":
-                raise HTTPException(status_code=500, detail="Assistant run failed")
-            elif run_status.status == "requires_action":
-                raise HTTPException(status_code=500, detail="Assistant requires action, not supported in this implementation")
-            
-            # 等待一秒后再次检查
-            time.sleep(1)
-        
-        # 获取最新的消息
-        messages = client.beta.threads.messages.list(thread_id=thread_id)
-        latest_message = messages.data[0]  # 最新的消息在列表开头
-        
-        result = latest_message.content[0].text.value
-        print(f"Assistant response: {result}")
+        result = response.choices[0].message.content
+        print(f"Chat API response: {result}")
         
         return {
             "content": result,
-            "assistant_id": assistant_id,
-            "thread_id": thread_id
+            "assistant_id": "chat-api",  # 使用固定值表示这是 Chat API
+            "thread_id": "chat-api"      # 使用固定值表示这是 Chat API
         }
         
     except Exception as e:
