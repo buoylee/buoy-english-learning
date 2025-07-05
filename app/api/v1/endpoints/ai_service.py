@@ -14,6 +14,8 @@ from langchain.tools import Tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph
 import logging
+import redis
+import itertools
 
 from app.core.config import settings
 from app.services.r2_service import r2_service # Import the R2 service instance
@@ -39,6 +41,12 @@ client = OpenAI(
 
 # 本地文件路径，用于保存 assistant 和 thread 的 ID
 DEV_IDS_FILE = "dev_assistant_ids.json"
+
+# Redis 连接（可根据实际情况配置 host/port/db）
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+REDIS_CHAT_KEY = 'chat_history:default'  # 单用户 demo，生产可用 user_id
+REDIS_CHAT_ID_KEY = 'chat_history:default:next_id'
+MAX_HISTORY = 20  # 只保留最近 20 条历史消息
 
 def load_dev_ids():
     """从本地文件加载 assistant 和 thread 的 ID"""
@@ -132,8 +140,39 @@ graph.add_node("agent", react_agent)
 graph.set_entry_point("agent")
 app_graph = graph.compile()
 
-# 全局内存历史（单用户/无隔离）
-chat_history = []
+def get_next_msg_id():
+    return int(redis_client.incr(REDIS_CHAT_ID_KEY))
+
+def get_redis_chat_key(session_id=None):
+    if session_id:
+        return f'chat_history:{session_id}'
+    return REDIS_CHAT_KEY
+
+# Redis List 版：获取最近 N 条历史
+
+def get_chat_history(limit=MAX_HISTORY, session_id=None):
+    redis_key = get_redis_chat_key(session_id)
+    messages = redis_client.lrange(redis_key, -limit, -1)
+    return [json.loads(m) for m in messages]
+
+def append_chat_message(msg: dict, session_id=None):
+    redis_key = get_redis_chat_key(session_id)
+    redis_client.rpush(redis_key, json.dumps(msg))
+    redis_client.ltrim(redis_key, -MAX_HISTORY, -1)
+
+def save_chat_history(history, session_id=None):
+    """
+    全量重置某会话的历史，仅用于后台清空/批量导入等特殊场景。
+    日常对话请用 append_chat_message。
+    """
+    redis_key = get_redis_chat_key(session_id)
+    # 最多只保存 MAX_HISTORY 条
+    history = history[-MAX_HISTORY:]
+    pipe = redis_client.pipeline()
+    pipe.delete(redis_key)
+    if history:
+        pipe.rpush(redis_key, *[json.dumps(m) for m in history])
+    pipe.execute()
 
 logger = logging.getLogger(__name__)
 
@@ -283,29 +322,57 @@ async def generate_transcription(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=error_detail)
 
 @router.post("/generate/agent_chat", response_model=AgentChatResponse)
-async def generate_agent_chat_response(request: AgentChatRequest):
+async def generate_agent_chat_response(request: AgentChatRequest, session_id: str = None):
     """
-    用 LangGraph ReAct Agent 实现的对话接口，后端自动保存多轮历史（单用户版）
+    用 LangGraph ReAct Agent 实现的对话接口，聊天历史持久化到 Redis，并限制历史条数
+    支持多会话，session_id 为空时兼容老逻辑
     """
     try:
-        global chat_history
-        messages = chat_history + [{"role": "user", "content": request.prompt}]
+        history = get_chat_history(session_id=session_id)
+        # 为新消息分配唯一 id
+        user_msg = {"role": "user", "content": request.prompt, "id": get_next_msg_id()}
+        append_chat_message(user_msg, session_id=session_id)
+        messages = history + [user_msg]
+        messages = messages[-MAX_HISTORY:]
         state = {"messages": messages}
         result = app_graph.invoke(state)
         new_history = result["messages"]
-        chat_history = new_history
-        ai_reply = next((m.content for m in reversed(new_history) if getattr(m, "type", None) == "ai"), "")
-        history_dict = [
-            {"role": getattr(m, "type", None), "content": m.content}
-            for m in new_history
+        # 只追加新生成的 ai/human/tool 消息（不重复追加 user）
+        new_msgs = [
+            {"role": getattr(m, "type", None), "content": m.content, "id": getattr(m, "id", None)}
+            for m in new_history if getattr(m, "type", None) != "user"
         ]
+        for msg in new_msgs:
+            if not msg.get("id"):
+                msg["id"] = get_next_msg_id()
+            append_chat_message(msg, session_id=session_id)
+        ai_reply = next((m["content"] for m in reversed(new_msgs) if m["role"] == "ai"), "")
         logger.info(f"[agent_chat] ai_reply: {ai_reply}")
-        logger.info(f"[agent_chat] history_dict: {history_dict}")
-        return {"content": ai_reply, "history": history_dict}
+        return {"content": ai_reply}
     except Exception as e:
         tb = traceback.format_exc()
         print(f"LangGraph agent error: {e}\n{tb}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/chat/history")
+async def get_chat_history_api(
+    before_msg_id: int | None = None,
+    limit: int = 10,  # 默认10
+    session_id: str = None,
+):
+    """
+    游标分页拉取聊天历史消息，只返回 user/human/ai 消息
+    支持多会话，session_id 为空时兼容老逻辑
+    """
+    limit = min(limit, 50)  # 最大50
+    messages = redis_client.lrange(get_redis_chat_key(session_id), 0, -1)
+    display_history = [json.loads(m) for m in messages if json.loads(m)["role"] in ("user", "human", "ai")]
+    # 按 id 倒序排列（最新在前）
+    display_history = sorted(display_history, key=lambda x: x.get("id", 0), reverse=True)
+    if before_msg_id:
+        display_history = [msg for msg in display_history if msg["id"] < before_msg_id]
+    paged = display_history[:limit]
+    return {"history": paged}
 
 # Assistant API 管理端点
 
