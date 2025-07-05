@@ -13,6 +13,7 @@ from langchain_community.utilities import SerpAPIWrapper
 from langchain.tools import Tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph
+import logging
 
 from app.core.config import settings
 from app.services.r2_service import r2_service # Import the R2 service instance
@@ -113,11 +114,28 @@ class TranscriptionResponse(BaseModel):
 
 class AgentChatRequest(BaseModel):
     prompt: str
-    model_name: str | None = None  # 新增，可选模型名
-
+    model_name: str | None = None
 class AgentChatResponse(BaseModel):
     content: str
     history: list
+
+# 全局只初始化一次 LLM、agent、graph、tools
+llm = ChatOpenAI(
+    openai_api_key=settings.OPENAI_API_KEY,
+    openai_api_base=settings.OPENAI_BASE_PATH,
+    model_name=getattr(settings, "OPENAI_MODEL_NAME", None) or "gpt-4o-mini",
+    temperature=0.7,
+)
+react_agent = create_react_agent(llm, tools)
+graph = StateGraph(dict)
+graph.add_node("agent", react_agent)
+graph.set_entry_point("agent")
+app_graph = graph.compile()
+
+# 全局内存历史（单用户/无隔离）
+chat_history = []
+
+logger = logging.getLogger(__name__)
 
 @router.post("/generate/speech", response_model=SpeechResponse)
 async def generate_speech_from_prompt(request: PromptRequest):
@@ -267,31 +285,22 @@ async def generate_transcription(file: UploadFile = File(...)):
 @router.post("/generate/agent_chat", response_model=AgentChatResponse)
 async def generate_agent_chat_response(request: AgentChatRequest):
     """
-    用 LangGraph ReAct Agent 实现的对话接口
+    用 LangGraph ReAct Agent 实现的对话接口，后端自动保存多轮历史（单用户版）
     """
     try:
-        # 动态选择模型名
-        model_name = request.model_name or getattr(settings, "OPENAI_MODEL_NAME", None) or "gpt-4o-mini"
-        llm = ChatOpenAI(
-            openai_api_key=settings.OPENAI_API_KEY,
-            openai_api_base=settings.OPENAI_BASE_PATH,
-            model_name=model_name,
-            temperature=0.7,
-        )
-        react_agent = create_react_agent(llm, tools)
-        graph = StateGraph(dict)
-        graph.add_node("agent", react_agent)
-        graph.set_entry_point("agent")
-        app_graph = graph.compile()
-        # 传递历史对话（如需多轮对话，可自行管理 history）
-        state = {"messages": [{"role": "user", "content": request.prompt}]}
+        global chat_history
+        messages = chat_history + [{"role": "user", "content": request.prompt}]
+        state = {"messages": messages}
         result = app_graph.invoke(state)
-        history = result["messages"]
-        ai_reply = next((m.content for m in reversed(history) if getattr(m, "type", None) == "ai"), "")
+        new_history = result["messages"]
+        chat_history = new_history
+        ai_reply = next((m.content for m in reversed(new_history) if getattr(m, "type", None) == "ai"), "")
         history_dict = [
             {"role": getattr(m, "type", None), "content": m.content}
-            for m in history
+            for m in new_history
         ]
+        logger.info(f"[agent_chat] ai_reply: {ai_reply}")
+        logger.info(f"[agent_chat] history_dict: {history_dict}")
         return {"content": ai_reply, "history": history_dict}
     except Exception as e:
         tb = traceback.format_exc()
