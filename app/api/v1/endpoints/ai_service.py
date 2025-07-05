@@ -10,12 +10,16 @@ from langchain.agents import initialize_agent, AgentType
 from langchain.memory import ConversationBufferMemory
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SerpAPIWrapper
+from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langchain.tools import Tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph
 import logging
 import redis
 import itertools
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.load import dumpd, load
+import requests
 
 from app.core.config import settings
 from app.services.r2_service import r2_service # Import the R2 service instance
@@ -26,12 +30,25 @@ router = APIRouter()
 print(f"=== Environment Variables Debug ===")
 print(f"OPENAI_API_KEY: {settings.OPENAI_API_KEY[:10]}..." if settings.OPENAI_API_KEY else "OPENAI_API_KEY: None")
 print(f"OPENAI_BASE_PATH: {settings.OPENAI_BASE_PATH}")
+print(f"OPENAI_MODEL_NAME: {settings.OPENAI_MODEL_NAME}")
 print(f"CLOUDFLARE_R2_ACCOUNT_ID: {settings.CLOUDFLARE_R2_ACCOUNT_ID}")
 print(f"CLOUDFLARE_R2_ACCESS_KEY_ID: {settings.CLOUDFLARE_R2_ACCESS_KEY_ID}")
 print(f"CLOUDFLARE_R2_SECRET_ACCESS_KEY: {settings.CLOUDFLARE_R2_SECRET_ACCESS_KEY[:10]}..." if settings.CLOUDFLARE_R2_SECRET_ACCESS_KEY else "CLOUDFLARE_R2_SECRET_ACCESS_KEY: None")
 print(f"CLOUDFLARE_R2_BUCKET_NAME: {settings.CLOUDFLARE_R2_BUCKET_NAME}")
 print(f"R2_PUBLIC_DOMAIN: {settings.R2_PUBLIC_DOMAIN}")
+print(f"=== Search Configuration ===")
+print(f"ENABLE_DUCKDUCKGO_SEARCH: {settings.ENABLE_DUCKDUCKGO_SEARCH}")
+print(f"ENABLE_GOOGLE_CUSTOM_SEARCH: {settings.ENABLE_GOOGLE_CUSTOM_SEARCH}")
+print(f"ENABLE_SERPAPI_FALLBACK: {settings.ENABLE_SERPAPI_FALLBACK}")
+print(f"GOOGLE_CUSTOM_SEARCH_API_KEY: {'Configured' if settings.GOOGLE_CUSTOM_SEARCH_API_KEY else 'Not configured'}")
+print(f"GOOGLE_CUSTOM_SEARCH_ENGINE_ID: {'Configured' if settings.GOOGLE_CUSTOM_SEARCH_ENGINE_ID else 'Not configured'}")
+print(f"SERPAPI_API_KEY: {'Configured' if settings.SERPAPI_API_KEY else 'Not configured'}")
+print(f"DUCKDUCKGO_TIMEOUT: {settings.DUCKDUCKGO_TIMEOUT}s")
 print(f"===================================")
+
+# 检查必需的环境变量
+if not settings.OPENAI_MODEL_NAME:
+    raise ValueError("OPENAI_MODEL_NAME environment variable is required but not set. Please set it in your .env file or environment.")
 
 # Initialize the OpenAI client
 client = OpenAI(
@@ -76,19 +93,242 @@ def save_dev_ids(assistant_id: str, thread_id: str):
 # 开发阶段：从本地文件加载或创建新的 assistant 和 thread
 assistant_id, thread_id = load_dev_ids()
 
+def create_search_tool():
+    """
+    创建搜索工具，三层级降级：DuckDuckGo -> Google Custom Search -> SerpAPI
+    """
+    # 初始化搜索服务状态跟踪
+    if not hasattr(create_search_tool, 'search_stats'):
+        create_search_tool.search_stats = {
+            'duckduckgo_failures': 0,
+            'google_custom_search_failures': 0,
+            'serpapi_failures': 0,
+            'last_duckduckgo_failure': 0,
+            'last_google_custom_search_failure': 0,
+            'last_serpapi_failure': 0,
+            'duckduckgo_successes': 0,
+            'google_custom_search_successes': 0,
+            'serpapi_successes': 0
+        }
+    
+    def google_custom_search(query: str) -> str:
+        """
+        使用 Google Custom Search API 进行搜索
+        """
+        try:
+            url = "https://www.googleapis.com/customsearch/v1"
+            params = {
+                'key': settings.GOOGLE_CUSTOM_SEARCH_API_KEY,
+                'cx': settings.GOOGLE_CUSTOM_SEARCH_ENGINE_ID,
+                'q': query,
+                'num': 5  # 返回前5个结果
+            }
+            
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if 'items' in data and data['items']:
+                # 提取搜索结果
+                results = []
+                for item in data['items']:
+                    title = item.get('title', '')
+                    snippet = item.get('snippet', '')
+                    link = item.get('link', '')
+                    results.append(f"{title}: {snippet} ({link})")
+                
+                return " | ".join(results)
+            else:
+                return "No results found"
+                
+        except Exception as e:
+            print(f"Google Custom Search failed: {e}")
+            return None
+    
+    def validate_api_keys():
+        """验证 API keys 的有效性"""
+        valid_keys = {}
+        
+        # 验证 Google Custom Search
+        if settings.GOOGLE_CUSTOM_SEARCH_API_KEY and settings.GOOGLE_CUSTOM_SEARCH_ENGINE_ID:
+            try:
+                result = google_custom_search("test")
+                if result and result != "No results found":
+                    valid_keys['google_custom_search'] = True
+                else:
+                    print("Google Custom Search API key validation failed")
+                    valid_keys['google_custom_search'] = False
+            except Exception as e:
+                print(f"Google Custom Search API key validation error: {e}")
+                valid_keys['google_custom_search'] = False
+        else:
+            valid_keys['google_custom_search'] = False
+        
+        # 验证 SerpAPI
+        if settings.SERPAPI_API_KEY:
+            try:
+                test_search = SerpAPIWrapper(serpapi_api_key=settings.SERPAPI_API_KEY)
+                result = test_search.run("test")
+                if result and not "Invalid API key" in str(result):
+                    valid_keys['serpapi'] = True
+                else:
+                    print("SerpAPI API key validation failed")
+                    valid_keys['serpapi'] = False
+            except Exception as e:
+                print(f"SerpAPI API key validation error: {e}")
+                valid_keys['serpapi'] = False
+        else:
+            valid_keys['serpapi'] = False
+        
+        return valid_keys
+    
+    # 验证 API keys（只在第一次调用时）
+    if not hasattr(create_search_tool, 'valid_api_keys'):
+        print("Validating search API keys...")
+        create_search_tool.valid_api_keys = validate_api_keys()
+        print(f"API key validation results: {create_search_tool.valid_api_keys}")
+    
+    def search_with_fallback(query: str) -> str:
+        """
+        搜索函数，三层级降级：DuckDuckGo -> Google Custom Search -> SerpAPI
+        """
+        import time
+        import random
+        current_time = time.time()
+        
+        # 检查各服务的健康状态
+        skip_duckduckgo = (
+            create_search_tool.search_stats['duckduckgo_failures'] > 3 and 
+            current_time - create_search_tool.search_stats['last_duckduckgo_failure'] < 300  # 5分钟内失败超过3次
+        )
+        
+        skip_google_custom_search = (
+            create_search_tool.search_stats['google_custom_search_failures'] > 2 and 
+            current_time - create_search_tool.search_stats['last_google_custom_search_failure'] < 600  # 10分钟内失败超过2次
+        )
+        
+        # 第一层：DuckDuckGo
+        if settings.ENABLE_DUCKDUCKGO_SEARCH and not skip_duckduckgo:
+            try:
+                if not hasattr(create_search_tool, 'duckduckgo_search'):
+                    create_search_tool.duckduckgo_search = DuckDuckGoSearchAPIWrapper()
+                
+                start_time = time.time()
+                result = create_search_tool.duckduckgo_search.run(query)
+                search_time = time.time() - start_time
+                
+                # 重置失败计数，增加成功计数
+                create_search_tool.search_stats['duckduckgo_failures'] = 0
+                create_search_tool.search_stats['duckduckgo_successes'] += 1
+                
+                # 处理 DuckDuckGo 返回结果
+                if result:
+                    if isinstance(result, str) and result.strip():
+                        print(f"DuckDuckGo search successful in {search_time:.2f}s")
+                        return f"[DuckDuckGo] {result}"
+                    elif isinstance(result, list) and result:
+                        # 如果是列表，取第一个结果
+                        first_result = result[0] if isinstance(result[0], str) else str(result[0])
+                        if first_result.strip():
+                            print(f"DuckDuckGo search successful in {search_time:.2f}s")
+                            return f"[DuckDuckGo] {first_result}"
+                else:
+                    print("DuckDuckGo search returned empty result")
+            except Exception as e:
+                error_msg = str(e)
+                create_search_tool.search_stats['duckduckgo_failures'] += 1
+                create_search_tool.search_stats['last_duckduckgo_failure'] = current_time
+                
+                if "Ratelimit" in error_msg or "429" in error_msg or "202" in error_msg:
+                    print(f"DuckDuckGo rate limited: {e}")
+                    # 增加延迟时间避免速率限制
+                    time.sleep(random.uniform(3, 8))
+                else:
+                    print(f"DuckDuckGo search failed: {e}")
+        
+        # 第二层：Google Custom Search（如果 API key 有效且未被跳过）
+        if (settings.ENABLE_GOOGLE_CUSTOM_SEARCH and 
+            create_search_tool.valid_api_keys.get('google_custom_search', False) and 
+            not skip_google_custom_search):
+            try:
+                start_time = time.time()
+                result = google_custom_search(query)
+                search_time = time.time() - start_time
+                
+                # 重置失败计数，增加成功计数
+                create_search_tool.search_stats['google_custom_search_failures'] = 0
+                create_search_tool.search_stats['google_custom_search_successes'] += 1
+                
+                # 处理 Google Custom Search 返回结果
+                if result and result != "No results found":
+                    print(f"Google Custom Search successful in {search_time:.2f}s")
+                    return f"[Google Custom Search] {result}"
+                else:
+                    print("Google Custom Search returned no results")
+            except Exception as e:
+                create_search_tool.search_stats['google_custom_search_failures'] += 1
+                create_search_tool.search_stats['last_google_custom_search_failure'] = current_time
+                print(f"Google Custom Search failed: {e}")
+        
+        # 第三层：SerpAPI（原始）
+        if (settings.ENABLE_SERPAPI_FALLBACK and 
+            create_search_tool.valid_api_keys.get('serpapi', False)):
+            try:
+                if not hasattr(create_search_tool, 'serpapi_search'):
+                    create_search_tool.serpapi_search = SerpAPIWrapper(serpapi_api_key=settings.SERPAPI_API_KEY)
+                
+                start_time = time.time()
+                result = create_search_tool.serpapi_search.run(query)
+                search_time = time.time() - start_time
+                
+                # 重置失败计数，增加成功计数
+                create_search_tool.search_stats['serpapi_failures'] = 0
+                create_search_tool.search_stats['serpapi_successes'] += 1
+                
+                # 处理 SerpAPI 返回结果
+                if result:
+                    if isinstance(result, str) and result.strip():
+                        print(f"SerpAPI search successful in {search_time:.2f}s")
+                        return f"[SerpAPI] {result}"
+                    elif isinstance(result, list) and result:
+                        # 如果是列表，合并所有结果
+                        if all(isinstance(item, str) for item in result):
+                            combined_result = " ".join(result)
+                            if combined_result.strip():
+                                print(f"SerpAPI search successful in {search_time:.2f}s")
+                                return f"[SerpAPI] {combined_result}"
+                        else:
+                            # 如果列表包含非字符串，转换为字符串
+                            combined_result = " ".join([str(item) for item in result])
+                            if combined_result.strip():
+                                print(f"SerpAPI search successful in {search_time:.2f}s")
+                                return f"[SerpAPI] {combined_result}"
+                else:
+                    print("SerpAPI search returned empty result")
+            except Exception as e:
+                create_search_tool.search_stats['serpapi_failures'] += 1
+                create_search_tool.search_stats['last_serpapi_failure'] = current_time
+                print(f"SerpAPI search failed: {e}")
+        
+        return "Error: All search services failed. Please try again later."
+    
+    return Tool(
+        name="search",
+        func=search_with_fallback,
+        description="Searches the web using DuckDuckGo (primary), Google Custom Search (secondary), or SerpAPI (fallback). Use this tool to find current information about recent events, news, or any topic you need to research."
+    )
+
 # === LangGraph ReAct Agent (with web search) ===
 llm = ChatOpenAI(
     openai_api_key=settings.OPENAI_API_KEY,
     openai_api_base=settings.OPENAI_BASE_PATH,
-    model_name="gpt-4o-mini",  # 使用 4.1 mini 模型
+    model_name=settings.OPENAI_MODEL_NAME,  # 使用环境变量配置的模型
     temperature=0.7,
 )
-search_api = SerpAPIWrapper(serpapi_api_key=settings.SERPAPI_API_KEY)
-search_tool = Tool(
-    name="search",
-    func=search_api.run,
-    description="Searches the web using SerpAPI"
-)
+
+# 使用工厂函数创建搜索工具
+search_tool = create_search_tool()
 tools = [search_tool]
 
 react_agent = create_react_agent(llm, tools)
@@ -125,13 +365,13 @@ class AgentChatRequest(BaseModel):
     model_name: str | None = None
 class AgentChatResponse(BaseModel):
     content: str
-    history: list
+    # history: list
 
 # 全局只初始化一次 LLM、agent、graph、tools
 llm = ChatOpenAI(
     openai_api_key=settings.OPENAI_API_KEY,
     openai_api_base=settings.OPENAI_BASE_PATH,
-    model_name=getattr(settings, "OPENAI_MODEL_NAME", None) or "gpt-4o-mini",
+    model_name=settings.OPENAI_MODEL_NAME,
     temperature=0.7,
 )
 react_agent = create_react_agent(llm, tools)
@@ -153,11 +393,63 @@ def get_redis_chat_key(session_id=None):
 def get_chat_history(limit=MAX_HISTORY, session_id=None):
     redis_key = get_redis_chat_key(session_id)
     messages = redis_client.lrange(redis_key, -limit, -1)
-    return [json.loads(m) for m in messages]
+    
+    def safe_load_message(data):
+        try:
+            msg_dict = json.loads(data)
+            
+            # 新格式：手动序列化的 dict
+            if "type" in msg_dict:
+                if msg_dict["type"] == "human":
+                    return HumanMessage(content=msg_dict.get("content", ""))
+                elif msg_dict["type"] == "ai":
+                    return AIMessage(content=msg_dict.get("content", ""))
+                # 不加载 tool 消息，避免 tool_calls 序列问题
+            
+            # 旧格式兼容
+            elif msg_dict.get("role") == "user" or msg_dict.get("role") == "human":
+                return HumanMessage(content=msg_dict.get("content", ""))
+            elif msg_dict.get("role") == "ai":
+                return AIMessage(content=msg_dict.get("content", ""))
+            # 不加载 tool 消息
+                
+        except Exception as e:
+            print(f"Failed to load message: {e}")
+            return None
+    
+    loaded_messages = []
+    for m in messages:
+        msg = safe_load_message(m)
+        if msg is not None:
+            loaded_messages.append(msg)
+    
+    return loaded_messages
 
-def append_chat_message(msg: dict, session_id=None):
+def append_chat_message(msg, session_id=None):
     redis_key = get_redis_chat_key(session_id)
-    redis_client.rpush(redis_key, json.dumps(msg))
+    
+    # 如果是 LangChain Message 对象，手动提取字段
+    if hasattr(msg, 'type') and hasattr(msg, 'content'):
+        msg_dict = {
+            "type": msg.type,
+            "content": msg.content,
+            "id": get_next_msg_id()
+        }
+        # 为 tool 消息添加特殊字段
+        if msg.type == "tool" and hasattr(msg, 'tool_call_id'):
+            msg_dict["tool_call_id"] = msg.tool_call_id
+        if hasattr(msg, 'name'):
+            msg_dict["name"] = msg.name
+        # 为 tool 消息添加标记，表示这是工具调用结果
+        if msg.type == "tool":
+            msg_dict["is_tool_result"] = True
+    else:
+        # 兼容普通 dict
+        msg_dict = msg
+        if isinstance(msg_dict, dict) and not msg_dict.get("id"):
+            msg_dict["id"] = get_next_msg_id()
+    
+    redis_client.rpush(redis_key, json.dumps(msg_dict))
     redis_client.ltrim(redis_key, -MAX_HISTORY, -1)
 
 def save_chat_history(history, session_id=None):
@@ -256,10 +548,13 @@ async def generate_chat_response(request: ChatRequest):
     if not settings.OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OpenAI API key is not configured on the server.")
     
+    if not settings.OPENAI_MODEL_NAME:
+        raise HTTPException(status_code=500, detail="OpenAI model name is not configured on the server.")
+    
     try:
         # 使用 Chat API 进行对话
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=settings.OPENAI_MODEL_NAME,
             messages=[
                 {
                     "role": "system",
@@ -330,23 +625,27 @@ async def generate_agent_chat_response(request: AgentChatRequest, session_id: st
     try:
         history = get_chat_history(session_id=session_id)
         # 为新消息分配唯一 id
-        user_msg = {"role": "user", "content": request.prompt, "id": get_next_msg_id()}
+        user_msg = HumanMessage(content=request.prompt)
         append_chat_message(user_msg, session_id=session_id)
+        
+        # 添加当前用户消息到历史
         messages = history + [user_msg]
         messages = messages[-MAX_HISTORY:]
+        
         state = {"messages": messages}
         result = app_graph.invoke(state)
         new_history = result["messages"]
+        
         # 只追加新生成的 ai/human/tool 消息（不重复追加 user）
-        new_msgs = [
-            {"role": getattr(m, "type", None), "content": m.content, "id": getattr(m, "id", None)}
-            for m in new_history if getattr(m, "type", None) != "user"
-        ]
+        new_msgs = []
+        for m in new_history:
+            if hasattr(m, "type") and m.type != "human":
+                new_msgs.append(m)
+        
         for msg in new_msgs:
-            if not msg.get("id"):
-                msg["id"] = get_next_msg_id()
             append_chat_message(msg, session_id=session_id)
-        ai_reply = next((m["content"] for m in reversed(new_msgs) if m["role"] == "ai"), "")
+        
+        ai_reply = next((m.content for m in reversed(new_msgs) if m.type == "ai"), "")
         logger.info(f"[agent_chat] ai_reply: {ai_reply}")
         return {"content": ai_reply}
     except Exception as e:
@@ -366,11 +665,42 @@ async def get_chat_history_api(
     """
     limit = min(limit, 50)  # 最大50
     messages = redis_client.lrange(get_redis_chat_key(session_id), 0, -1)
-    display_history = [json.loads(m) for m in messages if json.loads(m)["role"] in ("user", "human", "ai")]
+    
+    def safe_load_message(data):
+        try:
+            msg_dict = json.loads(data)
+            
+            # 新格式：手动序列化的 dict
+            if "type" in msg_dict:
+                if msg_dict["type"] in ("human", "ai"):
+                    return {
+                        "role": msg_dict["type"], 
+                        "content": msg_dict.get("content", ""), 
+                        "id": msg_dict.get("id")
+                    }
+            
+            # 旧格式兼容
+            elif msg_dict.get("role") in ("user", "human", "ai"):
+                return {
+                    "role": "human" if msg_dict.get("role") in ("user", "human") else "ai",
+                    "content": msg_dict.get("content", ""), 
+                    "id": msg_dict.get("id")
+                }
+        except Exception as e:
+            print(f"Failed to load message in history API: {e}")
+            return None
+    
+    # 处理消息
+    display_history = []
+    for m in messages:
+        msg_dict = safe_load_message(m)
+        if msg_dict:
+            display_history.append(msg_dict)
+    
     # 按 id 倒序排列（最新在前）
-    display_history = sorted(display_history, key=lambda x: x.get("id", 0), reverse=True)
+    display_history = sorted(display_history, key=lambda x: x.get("id", 0) or 0, reverse=True)
     if before_msg_id:
-        display_history = [msg for msg in display_history if msg["id"] < before_msg_id]
+        display_history = [msg for msg in display_history if (msg.get("id") or 0) < before_msg_id]
     paged = display_history[:limit]
     return {"history": paged}
 
@@ -379,7 +709,7 @@ async def get_chat_history_api(
 class CreateAssistantRequest(BaseModel):
     name: str = "English Learning Assistant"
     instructions: str = "You are a helpful English learning assistant. Help users improve their English skills through conversation, grammar correction, and vocabulary building."
-    model: str = "gpt-4o-mini"
+    model: str = settings.OPENAI_MODEL_NAME
 
 class AssistantResponse(BaseModel):
     assistant_id: str
@@ -551,6 +881,70 @@ async def get_dev_status():
         "thread_id": thread_id,
         "ids_file": DEV_IDS_FILE,
         "file_exists": os.path.exists(DEV_IDS_FILE)
+    }
+
+@router.get("/dev/search-status")
+async def get_search_status():
+    """
+    获取搜索服务状态，用于调试和监控
+    """
+    if hasattr(create_search_tool, 'search_stats'):
+        stats = create_search_tool.search_stats
+    else:
+        stats = {
+            'duckduckgo_failures': 0,
+            'google_custom_search_failures': 0,
+            'serpapi_failures': 0,
+            'last_duckduckgo_failure': 0,
+            'last_google_custom_search_failure': 0,
+            'last_serpapi_failure': 0,
+            'duckduckgo_successes': 0,
+            'google_custom_search_successes': 0,
+            'serpapi_successes': 0
+        }
+    
+    import time
+    current_time = time.time()
+    
+    # 获取 API key 验证状态
+    valid_api_keys = getattr(create_search_tool, 'valid_api_keys', {})
+    
+    return {
+        "search_configuration": {
+            "enable_duckduckgo": settings.ENABLE_DUCKDUCKGO_SEARCH,
+            "enable_google_custom_search": settings.ENABLE_GOOGLE_CUSTOM_SEARCH,
+            "enable_serpapi_fallback": settings.ENABLE_SERPAPI_FALLBACK,
+            "google_custom_search_configured": bool(settings.GOOGLE_CUSTOM_SEARCH_API_KEY and settings.GOOGLE_CUSTOM_SEARCH_ENGINE_ID),
+            "serpapi_configured": bool(settings.SERPAPI_API_KEY),
+            "duckduckgo_timeout": settings.DUCKDUCKGO_TIMEOUT
+        },
+        "api_key_validation": {
+            "google_custom_search_valid": valid_api_keys.get('google_custom_search', False),
+            "serpapi_valid": valid_api_keys.get('serpapi', False)
+        },
+        "search_statistics": {
+            "duckduckgo_failures": stats['duckduckgo_failures'],
+            "google_custom_search_failures": stats['google_custom_search_failures'],
+            "serpapi_failures": stats['serpapi_failures'],
+            "duckduckgo_successes": stats['duckduckgo_successes'],
+            "google_custom_search_successes": stats['google_custom_search_successes'],
+            "serpapi_successes": stats['serpapi_successes'],
+            "last_duckduckgo_failure_ago": f"{current_time - stats['last_duckduckgo_failure']:.1f}s" if stats['last_duckduckgo_failure'] > 0 else "Never",
+            "last_google_custom_search_failure_ago": f"{current_time - stats['last_google_custom_search_failure']:.1f}s" if stats['last_google_custom_search_failure'] > 0 else "Never",
+            "last_serpapi_failure_ago": f"{current_time - stats['last_serpapi_failure']:.1f}s" if stats['last_serpapi_failure'] > 0 else "Never"
+        },
+        "search_health": {
+            "duckduckgo_healthy": stats['duckduckgo_failures'] < 3,
+            "google_custom_search_healthy": stats['google_custom_search_failures'] < 2 and valid_api_keys.get('google_custom_search', False),
+            "serpapi_healthy": stats['serpapi_failures'] < 3 and valid_api_keys.get('serpapi', False),
+            "skip_duckduckgo": stats['duckduckgo_failures'] > 3 and (current_time - stats['last_duckduckgo_failure']) < 300,
+            "skip_google_custom_search": stats['google_custom_search_failures'] > 2 and (current_time - stats['last_google_custom_search_failure']) < 600
+        },
+        "recommendations": {
+            "primary_search": "DuckDuckGo" if stats['duckduckgo_failures'] < 3 else "Google Custom Search" if valid_api_keys.get('google_custom_search', False) else "SerpAPI",
+            "check_google_custom_search_key": not valid_api_keys.get('google_custom_search', False) and bool(settings.GOOGLE_CUSTOM_SEARCH_API_KEY and settings.GOOGLE_CUSTOM_SEARCH_ENGINE_ID),
+            "rate_limit_warning": stats['duckduckgo_failures'] > 0
+        }
     }
     
 
