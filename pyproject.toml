@@ -19,5 +19,6 @@ dependencies = [
     "pytest>=8.4.1",
     "python-dotenv>=1.1.0",
     "python-multipart>=0.0.20",
+    "redis>=6.2.0",
     "uvicorn[standard]>=0.34.3",
 ]
